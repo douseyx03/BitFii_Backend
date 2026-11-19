@@ -1,0 +1,425 @@
+# Bitfii — backend (LND Express API Server)
+
+> **Bitfii** :
+> - pour lancer le backend sur votre machine, suivez [GUIDELINE.md](GUIDELINE.md) ;
+> - la documentation de l'API (parcours de paiement, exemples de réponses, erreurs, intégration React) est dans [docs/API.md](docs/API.md).
+>
+> Basé sur [heyolaniran/connect-lnd](https://github.com/heyolaniran/connect-lnd), complété par la Team BitFii (montants FCFA, statut des factures, décodage, plafond, rôles boutique/client, tests).
+
+API backend construite avec Node.js + Express pour interagir avec un noeud **LND (Lightning Network Daemon)** via la librairie [`ln-service`](https://www.npmjs.com/package/ln-service).
+
+Ce service expose des endpoints REST pour:
+
+- recuperer les informations du wallet/noeud,
+- consulter les balances on-chain et Lightning,
+- lister les canaux ouverts et leur liquidite par canal,
+- creer et lister des factures Lightning,
+- payer une facture BOLT11,
+- signer et verifier des messages.
+
+## Vue d'ensemble du projet
+
+Le serveur:
+
+- initialise une connexion gRPC authentifiee vers LND au demarrage (et verifie que chaque noeud repond),
+- traduit les erreurs `ln-service` (`[status, message]`) en codes HTTP (`400`, `404`, `503`, ...),
+- protege optionnellement les routes `/api` par cle API (`API_KEY`),
+- expose des routes REST sous le prefixe `/api`,
+- renvoie des reponses JSON utilisables depuis Postman, curl, ou un frontend.
+
+Stack principale:
+
+- `express` pour l'API HTTP
+- `ln-service` pour les appels a LND
+- `dotenv` pour la configuration
+- `cors` pour autoriser les appels cross-origin
+- `nodemon` en mode developpement
+
+## Prerequis
+
+- Node.js 22+ (requis par `ln-service` 61+)
+- Un noeud LND actif et accessible en gRPC
+- Les credentials LND:
+  - hote/port gRPC (`host:port`, ex: `127.0.0.1:10009`)
+  - `admin.macaroon` encode en base64
+  - `tls.cert` encode en base64
+
+## Installation
+
+1. Cloner le repository:
+
+```bash
+git clone <url-du-repo>
+cd connect-lnd
+```
+
+1. Installer les dependances:
+
+```bash
+npm install
+```
+
+## Configuration (.env)
+
+Creer un fichier `.env` a la racine du projet. Le serveur supporte **jusqu'a 3 noeuds LND** en parallele.
+
+### Option A — un seul noeud (legacy)
+
+```env
+PORT=5003
+LND_GRPC_HOST=127.0.0.1:10009
+LND_MACAROON_BASE64=<votre_admin_macaroon_base64>
+LND_TLS_CERT_BASE64=<votre_tls_cert_base64>
+```
+
+### Option B — jusqu'a 3 noeuds (recommande)
+
+```env
+PORT=5003
+
+LND_NODE_ID_1=alice
+LND_GRPC_HOST_1=127.0.0.1:10009
+LND_MACAROON_BASE64_1=<macaroon_alice_base64>
+LND_TLS_CERT_BASE64_1=<tls_alice_base64>
+
+LND_NODE_ID_2=bob
+LND_GRPC_HOST_2=127.0.0.1:10010
+LND_MACAROON_BASE64_2=<macaroon_bob_base64>
+LND_TLS_CERT_BASE64_2=<tls_bob_base64>
+
+LND_NODE_ID_3=carol
+LND_GRPC_HOST_3=127.0.0.1:10011
+LND_MACAROON_BASE64_3=<macaroon_carol_base64>
+LND_TLS_CERT_BASE64_3=<tls_carol_base64>
+```
+
+- `LND_NODE_ID_N` est optionnel (defaut: `"1"`, `"2"`, `"3"`) et sert d'identifiant dans les URLs (`/api/nodes/alice/...`).
+- Les slots 2 et 3 sont optionnels; seuls les noeuds completement configures sont demarres.
+- Si `LND_GRPC_HOST_1` est defini, la config legacy (`LND_GRPC_HOST` sans suffixe) est ignoree pour le slot 1.
+- Les identifiants de noeuds doivent etre uniques (le serveur refuse de demarrer en cas de doublon).
+
+### Optionnel — securite
+
+```env
+# Exige `x-api-key: <valeur>` ou `Authorization: Bearer <valeur>` sur /api
+API_KEY=change-me
+
+# Restreint CORS a une liste d'origines (defaut: toutes)
+CORS_ORIGIN=http://localhost:3000,https://my-frontend.example
+```
+
+Sans `API_KEY`, les routes `/api` sont ouvertes: a reserver au developpement local, car elles permettent de payer des factures et de signer des messages.
+
+### Comment obtenir les valeurs base64
+
+Exemple Linux/macOS:
+
+```bash
+base64 -w 0 ~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon
+base64 -w 0 ~/.lnd/tls.cert
+```
+
+> Sur certains systemes macOS, utilisez `base64 <fichier>` (sans `-w 0`).
+
+### Ou trouver le macaroon dans Polar
+
+Si vous utilisez **Polar** pour lancer votre noeud LND:
+
+- Ouvrez Polar, puis cliquez sur votre noeud (ex: Alice/Bob).
+- Allez dans l'onglet de connexion/credentials (Connect / REST / gRPC selon la version).
+- Polar affiche le `admin.macaroon`, le `tls.cert` et l'adresse gRPC, que vous pouvez copier.
+- Vous pouvez ensuite convertir le macaroon et le certificat en base64 pour remplir:
+  - `LND_MACAROON_BASE64`
+  - `LND_TLS_CERT_BASE64`
+
+Selon votre configuration locale, les fichiers se trouvent souvent dans les volumes Docker de Polar (chemins variables selon OS/version). Le plus fiable reste de recuperer les valeurs directement depuis l'interface Polar.
+
+### Important securite
+
+- Le fichier `.env` contient des secrets sensibles.
+- Ne le committez jamais.
+- Evitez de partager vos valeurs `LND_MACAROON_BASE64` et `LND_TLS_CERT_BASE64`.
+
+## Lancer le projet
+
+### Production
+
+```bash
+npm start
+```
+
+### Developpement (reload automatique)
+
+```bash
+npm run dev
+```
+
+Si la connexion a LND est correcte, vous verrez un message de succes dans la console et la liste des endpoints disponibles.
+
+## Base URL
+
+Par defaut:
+
+`http://localhost:5003`
+
+## Endpoints et formats de requetes
+
+Toutes les reponses sont en JSON.
+
+### Health check
+
+- **Method**: `GET`
+- **Route**: `/health`
+- **Description**: ne depend pas de LND et ne requiert pas `API_KEY`. Renvoie l'etat de chaque noeud configure (`reachable`: `true`, `false` ou `null` si la verification est encore en cours).
+
+```bash
+curl -X GET http://localhost:5003/health
+```
+
+### Lister les noeuds connectes
+
+- **Method**: `GET`
+- **Route**: `/api/nodes`
+- **Description**: liste les noeuds configures (`id`, `grpcHost`, `reachable`).
+- **Exemple curl**:
+
+```bash
+curl -X GET http://localhost:5003/api/nodes
+```
+
+> Toutes les routes `/api` exigent `x-api-key` (ou `Authorization: Bearer`) lorsque `API_KEY` est defini.
+
+### Routes par noeud
+
+Pour cibler un noeud specifique, prefixez les routes avec `/api/nodes/:nodeId` (ex: `/api/nodes/alice/getinfo`).
+
+Les routes legacy sans `:nodeId` (`/api/getinfo`, etc.) utilisent toujours le **premier noeud configure**.
+
+### 1) Recuperer les infos du noeud
+
+- **Method**: `GET`
+- **Route**: `/api/nodes/:nodeId/getinfo` ou `/api/getinfo` (legacy)
+- **Body**: aucun
+- **Exemple curl**:
+
+```bash
+curl -X GET http://localhost:5003/api/getinfo
+```
+
+### 2) Recuperer les balances
+
+- **Method**: `GET`
+- **Route**: `/api/nodes/:nodeId/balance` ou `/api/balance` (legacy)
+- **Body**: aucun
+- **Exemple curl**:
+
+```bash
+curl -X GET http://localhost:5003/api/balance
+```
+
+> **Difference avec `/channels`**: `/balance` renvoie un total agrege (`offChainBalance`). `/channels` detaille chaque canal ouvert avec sa liquidite sortante et entrante.
+
+### 3) Lister les canaux et la liquidite
+
+- **Method**: `GET`
+- **Route**: `/api/nodes/:nodeId/channels` ou `/api/channels` (legacy)
+- **Body**: aucun
+- **Description**: retourne tous les canaux Lightning ouverts du noeud, avec la capacite de liquidite par canal (via `ln-service` / `getChannels`).
+- **Exemple curl**:
+
+```bash
+curl -X GET http://localhost:5003/api/nodes/alice/channels
+```
+
+Legacy (premier noeud configure):
+
+```bash
+curl -X GET http://localhost:5003/api/channels
+```
+
+- **Reponse (JSON)** — structure typique:
+
+```json
+{
+  "nodeId": "alice",
+  "count": 1,
+  "channels": [
+    {
+      "channel_id": "...",
+      "partner": "02...",
+      "capacity": 1000000,
+      "outbound_capacity": 500000,
+      "inbound_capacity": 500000,
+      "unsettled_balance": 0,
+      "sent": 0,
+      "received": 0,
+      "is_active": true,
+      "is_private": false,
+      "is_closing": false,
+      "is_opening": false,
+      "transaction_id": "...",
+      "transaction_vout": 0
+    }
+  ]
+}
+```
+
+- **Champs utiles pour la liquidite**:
+
+| Champ | Signification |
+|-------|---------------|
+| `outbound_capacity` | Liquidite sortante (satoshis que vous pouvez envoyer) |
+| `inbound_capacity` | Liquidite entrante (satoshis que vous pouvez recevoir) |
+| `capacity` | Taille totale du canal |
+| `unsettled_balance` | Montant en vol (HTLC non regles) |
+| `is_active` | Canal utilisable pour le routage |
+| `partner` | Cle publique du noeud pair |
+
+- Un canal est **bidirectionnel** (liquidite utilisable dans les deux sens) lorsque `outbound_capacity > 0` **et** `inbound_capacity > 0`.
+- Si `count` vaut `0`, le noeud n'a pas encore de canal ouvert (ouvrez-en un dans Polar, puis minez un bloc).
+
+### 4) Creer une facture Lightning
+
+- **Method**: `POST`
+- **Route**: `/api/nodes/:nodeId/invoice` ou `/api/invoice` (legacy)
+- **Headers**: `Content-Type: application/json`
+- **Body (JSON)**:
+
+```json
+{
+  "sats": 1000,
+  "description": "Paiement test"
+}
+```
+
+- `sats` est obligatoire, numerique, et > 0.
+- `description` est optionnel.
+- **Exemple curl**:
+
+```bash
+curl -X POST http://localhost:5003/api/invoice \
+  -H "Content-Type: application/json" \
+  -d '{"sats":1000,"description":"Paiement test"}'
+```
+
+#### Montant en FCFA (Bitfii)
+
+Envoyer `fcfa` a la place de `sats`: le serveur convertit avec le taux fixe `FCFA_PER_BTC` du `.env`
+(`sats = round(fcfa * 100 000 000 / FCFA_PER_BTC)`). La reponse contient `sats` et `fcfa`.
+
+```bash
+curl -X POST http://localhost:5003/api/nodes/boutique/invoice \
+  -H "Content-Type: application/json" \
+  -d '{"fcfa":600,"description":"Cafe"}'
+```
+
+#### Statut d'une facture
+
+- **Route**: `GET /api/nodes/:nodeId/invoices/:id` (`id` = payment hash renvoye a la creation)
+- **Reponse**: la facture LND, dont `is_confirmed` (payee) et `received` (sats recus). A interroger en polling pour afficher « Paye ».
+
+#### Decoder une facture (cote client)
+
+- **Route**: `POST /api/nodes/:nodeId/decode`, body `{"request":"lnbcrt..."}`
+- **Reponse**: `tokens` (montant en sats), `description`, `expires_at`, `is_expired`, `destination`.
+
+### 5) Lister les factures
+
+- **Method**: `GET`
+- **Route**: `/api/nodes/:nodeId/invoices` ou `/api/invoices` (legacy)
+- **Query (optionnel)**:
+  - `limit`: nombre de factures (entier entre 1 et 1000),
+  - `token`: curseur `next` renvoye par l'appel precedent, pour la pagination.
+- **Body**: aucun
+- **Reponse**: `{ nodeId, invoices, next }` (`next` vaut `null` quand il n'y a plus de page).
+- **Exemple curl**:
+
+```bash
+curl -X GET "http://localhost:5003/api/invoices?limit=50"
+```
+
+### 6) Payer une facture BOLT11
+
+- **Method**: `POST`
+- **Route**: `/api/nodes/:nodeId/pay` ou `/api/pay` (legacy)
+- **Headers**: `Content-Type: application/json`
+- **Body (JSON)**:
+
+```json
+{
+  "request": "lnbc1..."
+}
+```
+
+- `request` est obligatoire (chaine BOLT11 complete).
+- **Exemple curl**:
+
+```bash
+curl -X POST http://localhost:5003/api/pay \
+  -H "Content-Type: application/json" \
+  -d '{"request":"lnbc1..."}'
+```
+
+### 7) Signer un message
+
+- **Method**: `POST`
+- **Route**: `/api/nodes/:nodeId/signmessage` ou `/api/signmessage` (legacy)
+- **Headers**: `Content-Type: application/json`
+- **Body (JSON)**:
+
+```json
+{
+  "message": "Hello, LND!"
+}
+```
+
+- **Exemple curl**:
+
+```bash
+curl -X POST http://localhost:5003/api/signmessage \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Hello, LND!"}'
+```
+
+### 8) Verifier un message signe
+
+- **Method**: `POST`
+- **Route**: `/api/nodes/:nodeId/verifymessage` ou `/api/verifymessage` (legacy)
+- **Headers**: `Content-Type: application/json`
+- **Body (JSON)**:
+
+```json
+{
+  "message": "Hello, LND!",
+  "signature": "<signature>",
+  "pubkey": "<public_key_hex>"
+}
+```
+
+- Les 3 champs sont obligatoires.
+- **Reponse**: `{ nodeId, isValid, signedBy }`. Le serveur compare `signedBy` (renvoye par LND) avec `pubkey`.
+- **Exemple curl**:
+
+```bash
+curl -X POST http://localhost:5003/api/verifymessage \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Hello, LND!","signature":"<signature>","pubkey":"<public_key_hex>"}'
+```
+
+## Erreurs courantes
+
+- `401 Invalid or missing API key`: `API_KEY` est defini mais la requete n'envoie pas la bonne cle.
+- `404 Unknown LND node "..."`: l'identifiant `:nodeId` ne correspond a aucun noeud connecte (consultez `GET /api/nodes`).
+- `404 Route not found`: l'URL n'existe pas.
+- `400 Invalid JSON body`: le corps de la requete n'est pas du JSON valide.
+- `400` sur les routes `POST`: payload manquant ou invalide (`sats` entier > 0, `request` BOLT11, `message`, etc.).
+- `413 Request body too large`: corps > 1 Mo.
+- `503 FailedToConnectToDaemon` (ou autre erreur `503`): LND est injoignable, ou les credentials `.env` sont invalides.
+- Les erreurs renvoyees par LND conservent leur code HTTP (`400`, `404`, `503`, ...). Les details internes ne sont plus exposes au client; consultez les logs du serveur.
+- `500 Internal server error`: erreur inattendue cote serveur.
+
+## Scripts npm
+
+- `npm start`: demarrage standard
+- `npm run dev`: mode developpement avec `nodemon`
+- `npm test`: tests d'integration contre le serveur lance et le reseau Polar Bitfii (le test de paiement reel est saute si les noeuds sont injoignables)
